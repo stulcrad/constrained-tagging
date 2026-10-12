@@ -1,0 +1,407 @@
+import json
+from rapidfuzz import fuzz
+
+def json_safe_parse(text: str) -> tuple:
+    """
+    Extract and parse a JSON array from model output.
+
+    Returns:
+        (parsed, ok): `parsed` is the parsed list (empty on failure, or when
+        the model validly predicted zero entities). `ok` is False only when
+        the output could not be parsed into a JSON list at all -- no `[...]`
+        array present, malformed JSON, or the parsed value isn't a list.
+        `ok=True, parsed=[]` means the model validly predicted zero entities;
+        this is NOT a format failure and must not be conflated with `ok=False`.
+    """
+    try:
+        start = text.find("[")
+        end = text.rfind("]") + 1
+        if start == -1 or end <= start:
+            return [], False
+        parsed = json.loads(text[start:end])
+        if not isinstance(parsed, list):
+            return [], False
+        return parsed, True
+    except Exception:
+        return [], False
+
+
+def find_best_fuzzy_match(context:str, full_text:str, threshold: float = 0.7, matching_type:str = 'anchor') -> tuple:
+    """
+    Find the best fuzzy match of context in full_text using sliding window.
+    
+    Args:
+        context (str): The context string to match.
+        full_text (str): The full text string to search within.
+        threshold (float): Minimum similarity ratio to consider a match.
+        matching_type (str): Type of fuzzy matching to use: 'anchor', 'partial', 'full'.
+        
+    Returns:
+        (start_pos, end_pos, similarity) if match found above threshold, else (None, None, 0.0).
+    """
+    # Normalize inputs for case-insensitive matching
+    context_lower = context.lower()
+    full_text_lower = full_text.lower()
+    context_len = len(context_lower)
+
+    # 1) Fast exit on exact match
+    exact_start = full_text_lower.find(context_lower)
+    if exact_start != -1:
+        return (exact_start, exact_start + context_len, 1.0)
+    
+    # Fuzzy match with sliding window
+    best_ratio = 0.0
+    best_start = None
+    best_end = None
+
+    # 2) Fuzzy matching strategies
+    if matching_type == 'anchor':   
+        # ======== Partial ratio with anchor filtering ========
+        # Use start of context as anchor
+        anchor_len = 6 if context_len > 10 else 3
+        anchor = context_lower[:anchor_len]
+        # Find all positions of anchor in full_text
+        anchor_starts = []
+        pos = full_text_lower.find(anchor)
+
+        if pos == -1:
+            for i in range(len(full_text_lower) - anchor_len + 1):
+                window = full_text_lower[i:i + anchor_len]
+                ratio = fuzz.ratio(anchor, window) / 100.0
+                if ratio >= threshold:
+                    anchor_starts.append(i)
+        else:
+            while pos != -1:
+                anchor_starts.append(pos)
+                pos = full_text_lower.find(anchor, pos + 1)
+        # If no anchors found, use regular sliding window
+        if not anchor_starts:
+            anchor_starts = range(0, len(full_text_lower) - context_len + 1, max(1, context_len // 3))
+
+        for astart in anchor_starts:
+            # Check +-15 characters around context
+            win_start = max(0, astart - 15)
+            win_end = min(len(full_text_lower), astart + context_len + 15)
+            window = full_text_lower[win_start:win_end]
+            # Compute partial ratio with score cutoff, to find promising windows
+            ratio = fuzz.partial_ratio(context_lower, window, score_cutoff=int(threshold*100)) / 100.0
+            if ratio > best_ratio and ratio >= threshold:
+                best_ratio = ratio
+                # Find best matching substring within window
+                best_local_pos = -1
+                best_local_score = 0
+                # Go through all possible substrings of context length
+                for i in range(0, len(window) - context_len + 1):
+                    chunk = window[i:i + context_len]
+                    # Find ratio with score cutoff to speed up
+                    chunk_ratio = fuzz.ratio(context_lower, chunk, score_cutoff=int(best_local_score*100)) / 100.0
+                    if chunk_ratio > best_local_score:
+                        best_local_score = chunk_ratio
+                        best_local_pos = i
+
+                if best_local_pos != -1:
+                    best_start = win_start + best_local_pos
+                    best_end = best_start + context_len
+
+    if matching_type == 'partial':
+        # === Partial ratio with steps around window size ===
+        # Slide in steps to reduce number of comparisons
+        step = max(2, context_len // 10)
+
+        # Allow window bigger than context to catch punctuation/spacing differences
+        min_w = max(5, context_len - 5)
+        max_w = context_len + 10
+
+        for window_size in range(min_w, max_w + 1):
+            for i in range(0, len(full_text_lower) - window_size + 1, step):
+                window = full_text_lower[i:i + window_size]
+                ratio = fuzz.partial_ratio(context_lower, window, score_cutoff=int(threshold*100)) / 100.0
+                if ratio > best_ratio and ratio >= threshold:
+                    best_ratio = ratio
+                    best_start = i
+                    best_end = i + window_size
+        
+    if matching_type == 'full':
+        # === Full ratio with windows ===
+        # Try different window sizes around the context length
+        for window_size in range(max(1, context_len - 5), context_len + 10):
+            for i in range(len(full_text_lower) - window_size + 1):
+                window = full_text_lower[i:i + window_size]
+                ratio = fuzz.ratio(context_lower, window) / 100.0
+                if ratio > best_ratio:
+                    best_ratio = ratio
+                    best_start = i
+                    best_end = i + window_size
+
+    # 3) Return best match if above threshold
+    if best_ratio >= threshold:
+        return (best_start, best_end, best_ratio)
+    else:
+        return (None, None, 0.0)
+
+def assign_spans_from_context(full_text_tokens: list, entities: list, fuzzy: bool, valid_labels: set,
+                                 fuzzy_threshold: float = 0.7, matching_type:str = 'anchor',
+                                 json_parse_ok: bool = True, return_stats: bool = False):
+    """
+    Assign BIO tags to tokens based on extracted entities with context.
+
+    Args:
+        full_text_tokens (list): List of tokens from the full text.
+        entities (list): List of dicts from LLM output {"entity": ..., "label": ..., "context": ...}
+        fuzzy (bool): Whether to use fuzzy matching for context.
+        valid_labels (set): Set of valid entity labels.
+        fuzzy_threshold (float): Similarity threshold for fuzzy matching.
+        matching_type (str): Type of fuzzy matching to use: 'anchor', 'partial', 'full'.
+        json_parse_ok (bool): Whether the raw model output parsed into a valid
+            JSON list at all (see json_safe_parse). Feeds into stats['format_invalid']
+            alongside per-entity key checks, so a fully unparseable generation is
+            distinguished from one that validly predicted zero entities.
+
+    Returns:
+        list: BIO tags corresponding to full_text_tokens.
+        tuple(list, dict): When return_stats=True, also returns matching outcome counters.
+
+    stats['format_invalid'] is a single per-generation 0/1 flag (1 if the top-level
+    JSON failed to parse, OR at least one entity object was individually malformed),
+    directly comparable across methods -- e.g. against a grammar-constrained baseline
+    (xgrammar/Outlines), which should force this to 0 by construction, or against the
+    constrained-generation wrong-text rate. This is distinct from stats['invalid_entity_format'],
+    which counts individually malformed entity objects within an otherwise-parseable array.
+    """
+    tags = ['O'] * len(full_text_tokens)
+    full_text_str = " ".join(full_text_tokens)
+
+    stats = {
+        'processed_entities': 0,
+        'successful_entities': 0,
+        'invalid_entity_format': 0,
+        'format_invalid': 0,
+        'context_not_in_input': 0,
+        'entity_not_in_context': 0,
+        'fuzzy_helped': 0,
+        'exact_match': 0,
+        'invalid_label_count': 0,
+    }
+
+    for ent in entities:
+        if 'entity' not in ent or 'label' not in ent or 'context' not in ent:
+            print(f"\nInvalid entity format: {ent}")
+            stats['invalid_entity_format'] += 1
+            continue
+        stats['processed_entities'] += 1
+
+        entity_text = ent['entity']
+        entity_label = ent['label']
+        
+        if entity_label not in valid_labels:
+            stats['invalid_label_count'] += 1
+            continue
+
+        context_text = ent['context']
+        fuzzy_used = False
+
+        if fuzzy:
+            # Try exact match first, then fuzzy context match.
+            context_start = full_text_str.lower().find(context_text.lower())
+            if context_start != -1:
+                context_end = context_start + len(context_text)
+            else:
+                context_start, context_end, _ = find_best_fuzzy_match(
+                    context_text,
+                    full_text_str,
+                    threshold=fuzzy_threshold,
+                    matching_type=matching_type,
+                )
+                if context_start is not None:
+                    fuzzy_used = True
+
+            if context_start is None:
+                stats['context_not_in_input'] += 1
+                continue
+
+            matched_context = full_text_str[context_start:context_end]
+            entity_start_in_context = matched_context.lower().find(entity_text.lower())
+            if entity_start_in_context == -1:
+                entity_start_in_context, _, _ = find_best_fuzzy_match(
+                    entity_text,
+                    matched_context,
+                    threshold=fuzzy_threshold,
+                    matching_type=matching_type,
+                )
+                if entity_start_in_context is None:
+                    stats['entity_not_in_context'] += 1
+                    continue
+                fuzzy_used = True
+        else:
+            context_start = full_text_str.lower().find(context_text.lower())
+            if context_start == -1:
+                stats['context_not_in_input'] += 1
+                continue
+
+            context_end = context_start + len(context_text)
+            matched_context = full_text_str[context_start:context_end]
+
+            entity_start_in_context = matched_context.lower().find(entity_text.lower())
+            if entity_start_in_context == -1:
+                stats['entity_not_in_context'] += 1
+                continue
+
+        entity_char_start = context_start + entity_start_in_context
+        entity_char_end = entity_char_start + len(entity_text)
+
+        char_idx = 0
+        for i, tok in enumerate(full_text_tokens):
+            tok_start = char_idx
+            tok_end = tok_start + len(tok)
+            if tok_end > entity_char_start and tok_start < entity_char_end:
+                tag_prefix = "B-" if i-1 < 0 or tags[i-1] == "O" or not tags[i-1].endswith(entity_label) else "I-"
+                tags[i] = f"{tag_prefix}{entity_label}"
+            char_idx += len(tok) + 1
+
+        stats['successful_entities'] += 1
+        if fuzzy and fuzzy_used:
+            stats['fuzzy_helped'] += 1
+        else:
+            stats['exact_match'] += 1
+
+    stats['format_invalid'] = 1 if (not json_parse_ok or stats['invalid_entity_format'] > 0) else 0
+
+    if return_stats:
+        return tags, stats
+    return tags
+
+
+# ---------------------------------------------------------------------------
+# Character-level context matching -- the publication baseline
+# ---------------------------------------------------------------------------
+#
+# `assign_spans_from_context` above returns BIO tags over whitespace tokens, which is lossy for every task whose gold is
+# sub-token (Toxic Spans) or zero-length (MultiGEC's M), and it forces the model's input to be rebuilt as `"
+# ".join(tokens)` rather than the original string the constrained-generation arm copies verbatim. The function below
+# returns CHARACTER spans against the original text instead, so the baseline is scored by exactly the same metric code,
+# on exactly the same input, as the constrained arm.
+
+ERROR_TYPES = (
+    "success",
+    "empty_response",
+    "empty_prediction",
+    "format_error",
+    "format_max_tokens_exceeded",
+    "span_not_found",
+    "partial_span_not_found",
+    "invalid_label",
+    "partial_invalid_label",
+    "empty_label",
+    "partial_empty_label",
+)
+
+
+def assign_char_spans_from_context(full_text: str, entities: list, valid_labels: set,
+                                   json_parse_ok: bool = True,
+                                   insertion_labels: set = frozenset()):
+    """Locate each predicted {entity, label, context} item in `full_text`.
+
+    Returns `(spans, stats)`. `spans` are `{"start", "end", "label"}` dicts with character offsets into `full_text`,
+    end-exclusive -- the same shape `parse_spans_from_tagged_output` yields for the constrained arm, so both feed
+    `compute_overlap_counts` and `spans_to_char_set` unchanged.
+
+    Matching is two-stage and case-insensitive, mirroring the exact arm of `assign_spans_from_context`: the context
+    snippet is located in the full text first, then the entity is located inside that matched window. The snippet is
+    what disambiguates repeated occurrences -- an entity string on its own cannot say which occurrence it meant.
+
+    `insertion_labels` (MultiGEC's `{"M"}`) marks labels whose gold is a ZERO-LENGTH insertion point. For those the
+    located entity is the token before the gap, and the emitted span is empty and sits at `entity_end + 1`, i.e. at the
+    start of the following token.
+
+    Label validity is checked AFTER location, not before, so an item that could not be found is counted as a location
+    failure rather than being hidden behind a label failure. Spans carrying a label outside `valid_labels` are counted
+    in `stats['invalid_label_count']` and then DROPPED, which is what the constrained arm does with the same filter; the
+    rate is reported separately as the error the constraint removes.
+    """
+    stats = {
+        'processed_entities': 0,
+        'successful_entities': 0,
+        'invalid_entity_format': 0,
+        'format_invalid': 0,
+        'context_not_in_input': 0,
+        'entity_not_in_context': 0,
+        'exact_match': 0,
+        'invalid_label_count': 0,
+        'located_entities': 0,
+        'unlocated_entities': 0,
+    }
+
+    spans = []
+    lowered = full_text.lower()
+
+    for ent in entities:
+        if not isinstance(ent, dict) or 'entity' not in ent or 'label' not in ent or 'context' not in ent:
+            stats['invalid_entity_format'] += 1
+            continue
+        stats['processed_entities'] += 1
+
+        entity_text = str(ent['entity'])
+        entity_label = str(ent['label'])
+        context_text = str(ent['context'])
+
+        context_start = lowered.find(context_text.lower())
+        if context_start == -1:
+            stats['context_not_in_input'] += 1
+            stats['unlocated_entities'] += 1
+            continue
+        context_end = context_start + len(context_text)
+
+        matched_context = full_text[context_start:context_end]
+        entity_offset = matched_context.lower().find(entity_text.lower())
+        if entity_offset == -1:
+            stats['entity_not_in_context'] += 1
+            stats['unlocated_entities'] += 1
+            continue
+
+        stats['located_entities'] += 1
+
+        if entity_label not in valid_labels:
+            stats['invalid_label_count'] += 1
+            continue
+
+        start = context_start + entity_offset
+        end = start + len(entity_text)
+        if entity_label in insertion_labels:
+            # Zero-length insertion point just after the preceding token.
+            start = end = end + 1
+
+        spans.append({"start": start, "end": end, "label": entity_label})
+        stats['successful_entities'] += 1
+        stats['exact_match'] += 1
+
+    stats['format_invalid'] = 1 if (not json_parse_ok or stats['invalid_entity_format'] > 0) else 0
+    return spans, stats
+
+
+def classify_generation_error(raw_output: str, json_parse_ok: bool, n_items: int,
+                              stats: dict, hit_token_cap: bool = False) -> str:
+    """
+    One error label per generation, to know what type of error happened for each example.
+    """
+    if not (raw_output or "").strip():
+        return "empty_response"
+    if json_parse_ok and n_items == 0:
+        return "empty_prediction"
+
+    located = stats['located_entities']
+    unlocated = stats['unlocated_entities']
+
+    if located == 0 and unlocated == 0:
+        # Nothing parseable came back at all.
+        return "format_max_tokens_exceeded" if hit_token_cap else "format_error"
+    if located == 0:
+        return "span_not_found"
+    if unlocated > 0:
+        return "partial_span_not_found"
+
+    invalid = stats['invalid_label_count']
+    if invalid == located:
+        return "invalid_label"
+    if invalid > 0:
+        return "partial_invalid_label"
+    return "success"

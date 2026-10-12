@@ -1,0 +1,67 @@
+"""
+Every model has different special tags to signal the model is thinking. This file contains functions
+specific for each model to determine if the model is reasoning or not, print only the output of the model, and
+other model specific utilities.
+"""
+import torch
+from typing import List
+
+def extract_harmony_final_channel(text: str) -> str:
+    """Isolate GPT-OSS's harmony 'final' channel from its raw decoded output.
+
+    Harmony wraps the answer as `...<|channel|>final<|message|>ANSWER<|return|>`, extract
+    this answer to skip any preceding 'analysis' channel content.
+    """
+    marker = "<|channel|>final<|message|>"
+    idx = text.rfind(marker)
+    if idx == -1:
+        return text
+    tail = text[idx + len(marker):]
+    for end_marker in ("<|return|>", "<|end|>", "<|call|>", "<|start|>"):
+        end_idx = tail.find(end_marker)
+        if end_idx != -1:
+            tail = tail[:end_idx]
+    return tail.strip()
+
+def find_answer_start(token_ids: List[int], reasoning_end_marker: List[int]) -> "int | None":
+    """Index in `token_ids` where the answer begins, i.e. right AFTER the first full
+    occurrence of the reasoning-end marker subsequence. Returns None if the marker
+    never appears (reasoning was truncated before it ended).
+
+    The marker tokens themselves are attributed to the reasoning side (the answer
+    starts strictly after them), matching where the constrained processor records
+    `output_start_index`, so the constrained and unconstrained paths split identically.
+    """
+    if not reasoning_end_marker:
+        return None
+    m = len(reasoning_end_marker)
+    for i in range(len(token_ids) - m + 1):
+        if token_ids[i:i + m] == reasoning_end_marker:
+            return i + m
+    return None
+
+
+def reasoning_ended(input_ids: torch.LongTensor, reasoning_end_marker: List[int], found_reasoning_end: bool) -> bool:
+    """
+    Determine if the model has finished reasoning based on the presence of a reasoning marker in the text.
+
+    Args:
+        text (str): The text output from the model.
+        reasoning_end_marker (str): The marker indicating that reasoning has ended.
+        found_reasoning_end (bool): A flag indicating if the reasoning end marker has been found in previous checks.
+    """
+    if found_reasoning_end:
+        return True
+
+    # Check if the reasoning end marker is present in the input_ids
+    if not reasoning_end_marker:
+        return False  # No reasoning end marker provided, cannot determine if reasoning has ended
+
+    m = len(reasoning_end_marker)
+
+    if input_ids.shape[-1] < m:
+        return False # Input is shorter than the reasoning end marker, cannot have ended reasoning
+
+    # Check if the last m tokens of input_ids match the reasoning end marker
+    return input_ids[0, -m:].tolist() == reasoning_end_marker
+    

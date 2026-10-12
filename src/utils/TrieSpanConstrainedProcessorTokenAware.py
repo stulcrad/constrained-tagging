@@ -1,0 +1,477 @@
+from transformers import LogitsProcessor, AutoTokenizer
+from typing import List, Set, Optional, Callable
+import torch
+from utils.TokTrie import TokTrie, build_toktrie_from_tokenizer
+
+class TrieSpanConstrainedProcessorTokenAware(LogitsProcessor):
+    """
+    Token-aware constrained generation processor for span classification with generative LLMs.
+
+    Copy behavior:
+    -------------
+    1. Constrained copy is performed inside each tokenized token (not over full input bytes).
+    2. For the current input token remainder (e.g. b"ade"), allowed copy tokens are all trie prefixes
+       (e.g. b"a", b"ad", b"ade").
+    3. If model emits b"a", we stay in the same input token and continue with b"de".
+    4. For reasoning models, the processor can optionally allow unconstrained reasoning tokens to be emitted before
+       the first output token, and then enforce the span constraints after reasoning has ended.
+
+    Tagging behavior:
+    -----------------
+    Model may emit <SPAN><LABEL>...</LABEL> ... </SPAN> while preserving exact token-wise copying.
+
+    """
+
+    def __init__(self, labels: list[str],  input_text: str, tokenizer: AutoTokenizer,
+                 toktrie: Optional[TokTrie] = None, reasoning_model: bool = False,
+                 reasoning_ended: Optional[Callable[[torch.LongTensor, List[int], bool], bool]] = None,
+                 reasoning_end_marker: Optional[List[int]] = None, reasoning_start_marker: Optional[List[int]] = None,
+                 model_eos_token_id=None,
+                 tokenizer_eos_token_id=None,
+                 allow_empty_span_labels: Optional[Set[str]] = None,
+                 force_empty_span_labels: Optional[Set[str]] = None
+                ):
+        """
+        Initialize the TrieSpanConstrainedProcessorTokenAware processor.
+
+        Args:
+            labels (list[str]): List of label strings for span classification.
+            input_text (str): The input text to be copied and tagged.
+            tokenizer (AutoTokenizer): The tokenizer used for encoding the input text and labels.
+            toktrie (Optional[TokTrie]): Optional token trie for efficient prefix search of token bytes. If not provided, it will be built from the tokenizer.
+            reasoning_model (bool): Whether the model is a reasoning model that allows unconstrained reasoning tokens before the first output token.
+            reasoning_ended (Optional[Callable[[torch.LongTensor, List[int], bool], bool]]): Optional callable to determine if reasoning has ended based on the generated tokens.
+            reasoning_end_marker (Optional[List[int]]): Optional list of token IDs that mark the end of reasoning.
+            reasoning_start_marker (Optional[List[int]]): Optional list of token IDs that mark the start of reasoning 
+                                                          (is important for Gemma, which can skip reasoning, 
+                                                          and the processor must know this)
+            model_eos_token_id (int | list[int] | None): The model's own generation_config.eos_token_id(s)
+            tokenizer_eos_token_id (int | list[int] | None): The tokenizer's own eos_token_id(s), passed in
+                                                             explicitly by the caller (e.g. tokenizer.eos_token_id).
+            allow_empty_span_labels (Optional[Set[str]]): Set of labels that are allowed to close a span with no copied text.
+            force_empty_span_labels (Optional[Set[str]]): Set of labels that are forced to close a span with no copied text.
+        """
+        # Store the labels for constructing the control tokens for opening spans.
+        self.labels = labels
+
+        # Store the tokenizer and token trie for constraint logic.
+        self.tokenizer = tokenizer
+        self.toktrie = toktrie if toktrie is not None else build_toktrie_from_tokenizer(tokenizer)
+
+        # Store the input text and its token-level representation for tracking how much of the input has been copied so far.
+        self.input_text = input_text
+
+        # Token-level copy source: we track progress as (token index, byte offset inside that token).
+        self.input_token_ids = tokenizer.encode(input_text, add_special_tokens=False)
+        self.input_token_bytes: List[bytes] = [
+            self.toktrie.token_id_to_bytes[tok_id]
+            for tok_id in self.input_token_ids
+        ]
+
+        # Ensure that the tokenizer did not alter the input text (e.g. normalization) 
+        # by checking that the concatenated token bytes match the original input text.
+        assert b"".join(self.input_token_bytes) == input_text.encode("utf-8"), \
+            "Tokenizer altered the input text (normalization); copy source is not the original"
+        
+        # Pointers to track how much of the input has been copied so far at the token level.
+        self.input_token_ptr = 0
+        self.input_token_byte_ptr = 0
+
+        # Byte offsets that fall BETWEEN complete characters. A tag may only open or close
+        # at one of these -> never inside a multi-byte character's own bytes.
+        offset = 0
+        self._char_boundary_offsets: Set[int] = {0}
+        for ch in input_text:
+            offset += len(ch.encode("utf-8"))
+            self._char_boundary_offsets.add(offset)
+
+        # Store the start offsets of each token in the input text for quick global byte offset calculations.
+        # Is used so the check is O(1) instead of O(n) when checking if the current byte offset is at a character boundary.
+        self._token_start_offsets: List[int] = []
+        _acc = 0
+        for b in self.input_token_bytes:
+            self._token_start_offsets.append(_acc)
+            _acc += len(b)
+        self._token_start_offsets.append(_acc)  # add the end offset for the last token
+
+        self.reasoning_model = reasoning_model
+        # Set unconditionally: __call__ reads these on every path, including the
+        # reasoning-OFF one, where reasoning_model is False.
+        self.reasoning_ended = reasoning_ended
+        self.found_reasoning_end = False
+        self.reasoning_started = False
+        self.reasoning_start_marker = reasoning_start_marker
+        self.reasoning_end_marker = reasoning_end_marker
+        self.output_start_index = None # will be set to the index of the first output token after reasoning
+
+        self.prompt_len = None # will be set to the length of the prompt (input_ids) when generation starts
+
+        # Runtime generation bookkeeping.
+        self.STATE = "OUTSIDE"
+        self.seq_pos = 0  # used only for SPAN_CLOSE sequencing
+        self.prev_len = 0 # track the len of the generated seq
+
+        # Per-label position tracking for TAG_BLOCK disambiguation.
+        # Maps label -> current position within that label's open block token sequence.
+        # Blocks whose token doesn't match the emitted token are dropped immediately,
+        # preventing tokens from eliminated blocks from polluting the allowed set.
+        self.live_blocks: Optional[dict] = None
+
+        # Tracks whether at least one copy token was emitted in the current span body.
+        self.span_text_has_content = False
+
+        # Labels permitted to close a span with NO copied text -> MultiGEC's 'M', meaning
+        # a word is missing here, is a zero len insertion point.
+        self.allow_empty_span_labels: Set[str] = set(allow_empty_span_labels or ())
+        # Labels that are forced to close a span with NO copied text -> MultiGEC's 'M', meaning
+        # a word is missing here, is a zero len insertion point.
+        self.force_empty_span_labels: Set[str] = set(force_empty_span_labels or ())
+        # set to the global byte offset of the last empty span, to prevent consecutive empty spans
+        self._last_empty_span_offset: Optional[int] = None  
+
+        # Structural token sequences.
+        self.SPAN_CLOSE = self.tokenizer.encode("</SPAN>", add_special_tokens=False)
+
+        # Pre-encode the label tokens for quick access during generation (with and without space)
+        self.label_open_blocks = {
+            label: tokenizer.encode(f" <SPAN><LABEL>{label}</LABEL>", add_special_tokens=False)
+            for label in labels
+        }
+        self.label_open_blocks_nospace = {
+            label: tokenizer.encode(f"<SPAN><LABEL>{label}</LABEL>", add_special_tokens=False)
+            for label in labels
+        }
+        self.selected_label = None  # set when entering SPAN_TEXT, not during TAG_BLOCK
+        self._active_blocks = self.label_open_blocks  # which variant (space / no-space) is active
+
+        # End tokens accepted once all input tokens are fully consumed.
+        self.eos_token_ids: Set[int] = set()
+        if tokenizer_eos_token_id is None:
+            tokenizer_eos_token_id = tokenizer.eos_token_id
+        for eos_ids in (tokenizer_eos_token_id, model_eos_token_id):
+            if eos_ids is None:
+                continue
+            if isinstance(eos_ids, (list, tuple, set)):
+                self.eos_token_ids.update(eos_ids)
+            else:
+                self.eos_token_ids.add(eos_ids)
+        for tok in ["<end_of_turn>", "<|im_end|>", "<|eot_id|>", "<|return|>", "<turn|>"]:
+            tok_id = tokenizer.convert_tokens_to_ids(tok)
+            if tok_id is not None and tok_id != tokenizer.unk_token_id:
+                self.eos_token_ids.add(tok_id)
+
+    def reset(self):
+        """
+        Reset the processor state for a new generation sequence.
+        """
+        self.STATE = "OUTSIDE"
+        self.seq_pos = 0
+
+        self.input_token_ptr = 0
+        self.input_token_byte_ptr = 0
+
+        self.selected_label = None
+        self.live_blocks = None
+        
+        self.span_text_has_content = False
+        self._last_empty_span_offset = None
+        
+        self.prev_len = 0
+        self._active_blocks = None
+
+        self.prompt_len = None
+        self.found_reasoning_end = False
+        self.reasoning_started = False
+        self.output_start_index = None
+
+    def _mask_except(self, scores: torch.FloatTensor, allowed_tokens: Set[int]) -> torch.FloatTensor:
+        """
+        Mask the scores to only allow the specified token IDs in allowed_tokens, setting all other token scores to -inf.
+        """
+        if not allowed_tokens:
+            # Avoid all -inf rows, which break sampling (nan/inf probabilities).
+            return scores
+        mask = torch.ones_like(scores, dtype=torch.bool)
+        mask[:, list(allowed_tokens)] = False
+        scores = scores.masked_fill(mask, -float("inf"))
+        return scores
+
+    def _all_input_consumed(self) -> bool:
+        """
+        Check if all input tokens have been fully consumed (i.e. copied) so far, 
+        based on the current token pointer and byte pointer.
+        """
+        return self.input_token_ptr >= len(self.input_token_bytes)
+
+    def _normalize_token_cursor(self) -> None:
+        """Advance to the next input token when current token bytes are exhausted."""
+        while not self._all_input_consumed():
+            cur_len = len(self.input_token_bytes[self.input_token_ptr])
+            if self.input_token_byte_ptr < cur_len:
+                break
+            self.input_token_ptr += 1
+            self.input_token_byte_ptr = 0
+
+    def _global_byte_offset(self) -> int:
+        """
+        Get the current global byte offset in the input text based on the current input position.
+        """
+        return self._token_start_offsets[self.input_token_ptr] + self.input_token_byte_ptr
+
+    def _at_char_boundary(self) -> bool:
+        """
+        Check if the current global byte offset is at a character boundary in the input text.
+        This ensures that tags are only opened or closed at valid character boundaries, not inside multi-byte
+        """
+        return self._global_byte_offset() in self._char_boundary_offsets
+    
+    def _current_remaining_bytes(self) -> bytes:
+        """
+        Get the remaining byte suffix of the current input token that has not been copied yet, 
+        based on the current token pointer and byte pointer.
+        """
+        self._normalize_token_cursor()
+        if self._all_input_consumed():
+            return b""
+        cur = self.input_token_bytes[self.input_token_ptr]
+        return cur[self.input_token_byte_ptr:]
+    
+    def _allowed_copy_tokens(self) -> Set[int]:
+        """
+        Get the set of token IDs that can be emitted to copy the next part of the input text, 
+        based on the remaining byte suffix of the current input token and the token trie.
+        """
+        remaining = self._current_remaining_bytes()
+        if not remaining:
+            return set()
+        return self.toktrie.prefix_search(remaining)
+
+    def _prefer_literal_angle_bracket(self) -> bool:
+        """
+        If the source text currently starts with '<', prevent starting a control tag at this step.
+        This avoids confusing literal '<' in text with control token '<SPAN>'.
+        """
+        return self._current_remaining_bytes().startswith(b"<")
+
+    def _consume_copy_token(self, token_id: int) -> bool:
+        """
+        Consume a copy token and advance the input token pointer and byte pointer 
+        if the given token ID corresponds to a token that can copy the next part of the input text.
+        """
+        if self._all_input_consumed():
+            return False
+        token_bytes = self.toktrie.token_id_to_bytes.get(token_id)
+        if not token_bytes:
+            return False
+        remaining = self._current_remaining_bytes()
+        if not remaining.startswith(token_bytes):
+            return False
+
+        # Advance the byte pointer by the length of the consumed token bytes
+        self.input_token_byte_ptr += len(token_bytes)
+        cur_len = len(self.input_token_bytes[self.input_token_ptr])
+
+        # If the current input token was fully consumed, move to next token.
+        if self.input_token_byte_ptr >= cur_len:
+            self.input_token_ptr += 1
+            self.input_token_byte_ptr = 0
+        return True
+
+    def _advance_state(self, token_id: int) -> None:
+        """
+        Advance the FSM state based on the emitted token ID, updating the current state, sequence position, selected label,
+        and span text content flag as needed according to the constrained generation logic.
+        """
+        if self.STATE == "OUTSIDE":
+            # First check if the last emitted token is a copy token, and if so, consume it and advance the input position accordingly.
+            if self._consume_copy_token(token_id):
+                return
+            # Enter atomic tag block once any block-start token is emitted
+            space_match = any(block and token_id == block[0] for block in self.label_open_blocks.values())
+            nospace_match = any(block and token_id == block[0] for block in self.label_open_blocks_nospace.values())
+            if space_match:
+                remaining = self._current_remaining_bytes()
+                can_copy_after_space = bool(remaining[1:]) and bool(self.toktrie.prefix_search(remaining[1:]))
+                if remaining.startswith(b" ") and can_copy_after_space:
+                    self.input_token_byte_ptr += 1
+                    self._normalize_token_cursor()
+                else:
+                    print(
+                        f"Warning: rejected space-prefixed block at token {self.input_token_ptr}, "
+                        f"byte {self.input_token_byte_ptr}; cannot continue copying after consuming leading space"
+                    )
+                    return
+                self.STATE = "TAG_BLOCK"
+                self.live_blocks = {label: 1 for label in self.labels}
+                self.selected_label = None
+                self._active_blocks = self.label_open_blocks
+                return
+            if nospace_match:
+                self.STATE = "TAG_BLOCK"
+                self.live_blocks = {label: 1 for label in self.labels}
+                self.selected_label = None
+                self._active_blocks = self.label_open_blocks_nospace
+                return
+            return
+
+        if self.STATE == "TAG_BLOCK":
+            # Advance each live block if its next expected token matches the emitted token,
+            # and drop blocks that do not match. This prevents tokens from eliminated blocks
+            # (e.g. "ISC" from the MISC block after ">" was chosen instead of ">M") from
+            # appearing in the allowed set at subsequent steps.
+            new_live = {}
+            for label, pos in self.live_blocks.items():
+                block = self._active_blocks[label]
+                if pos < len(block) and block[pos] == token_id:
+                    new_pos = pos + 1
+                    if new_pos == len(block):
+                        # This label's open block is fully emitted: transition to SPAN_TEXT.
+                        self.STATE = "SPAN_TEXT"
+                        self.selected_label = label
+                        self.live_blocks = None
+                        self.seq_pos = 0
+                        self.span_text_has_content = False
+                        return
+                    new_live[label] = new_pos
+            self.live_blocks = new_live
+            return
+
+        if self.STATE == "SPAN_TEXT":
+            # First check if the last emitted token is a copy token, and if so, consume it and advance the input position accordingly.
+            if self._consume_copy_token(token_id):
+                self.span_text_has_content = True
+                return
+            # If the emitted token is not a copy token, it can only be the start of the closing tag
+            if token_id == self.SPAN_CLOSE[0]:
+                self.STATE = "SPAN_CLOSE"
+                self.seq_pos = 1
+                return
+            return
+
+        if self.STATE == "SPAN_CLOSE":
+            # Advance through the span close sequence until it is complete, then return to OUTSIDE state
+            if self.seq_pos < len(self.SPAN_CLOSE) and token_id == self.SPAN_CLOSE[self.seq_pos]:
+                self.seq_pos += 1
+                if self.seq_pos == len(self.SPAN_CLOSE):
+                    if not self.span_text_has_content:
+                        self._last_empty_span_offset = self._global_byte_offset()
+                    self.STATE = "OUTSIDE"
+                    self.seq_pos = 0
+                    self.span_text_has_content = False
+                return
+
+    def _allowed_tokens(self) -> Set[int]:
+        """
+        Get the set of allowed token IDs for the next generation step based on the current FSM state and seq position,
+        using the token trie to find valid copy tokens for the remaining input bytes, and allowing the appropriate special tokens
+        """
+        if self.STATE == "OUTSIDE":
+            # Allow all tokens that can copy the next part of the input text based on the current token-level position
+            allowed = self._allowed_copy_tokens()
+            # Additionally, allow the tokens that can start any of the label blocks, unless the next part of the input text starts with '<'
+            if not self._prefer_literal_angle_bracket() and self._at_char_boundary():
+                remaining = self._current_remaining_bytes()
+                can_copy_after_space = bool(remaining[1:]) and bool(self.toktrie.prefix_search(remaining[1:]))
+                if remaining.startswith(b" ") and can_copy_after_space:
+                    allowed.update(tok[0] for tok in self.label_open_blocks.values())
+                    self._active_blocks = self.label_open_blocks # pre-set the active blocks so _advance_state sees the correct variant
+                else:
+                    allowed.update(tok[0] for tok in self.label_open_blocks_nospace.values())
+                    self._active_blocks = self.label_open_blocks_nospace # pre-set the active blocks so _advance_state sees the correct variant
+            # If all input has been consumed, allow only EOS tokens to end the generation.
+            if self._all_input_consumed():
+                allowed = set(self.eos_token_ids)
+            return allowed
+
+        if self.STATE == "TAG_BLOCK":
+            # Only allow the next token from blocks that are still live (consistent with
+            # tokens emitted so far). Eliminated blocks are already absent from live_blocks.
+            allowed = set()
+            for label, pos in self.live_blocks.items():
+                block = self._active_blocks[label]
+                if pos < len(block):
+                    allowed.add(block[pos])
+            return allowed
+
+        if self.STATE == "SPAN_TEXT":
+            # We allow all tokens that can copy the next part of the input text
+            at_boundary = self._at_char_boundary()
+            may_close_empty = (
+                self.selected_label in self.allow_empty_span_labels
+                or self.selected_label in self.force_empty_span_labels
+            ) and self._last_empty_span_offset != self._global_byte_offset()
+
+            if (self.selected_label in self.force_empty_span_labels
+                    and may_close_empty and at_boundary):
+                # Force empty span close: if the active label is in force_empty_span_labels, we must allow the span
+                # close token even if there is no content copied yet.
+                return {self.SPAN_CLOSE[0]}
+            
+            allowed = self._allowed_copy_tokens()
+            if (self.span_text_has_content or may_close_empty) and at_boundary:
+                allowed.add(self.SPAN_CLOSE[0])
+            return allowed
+
+        if self.STATE == "SPAN_CLOSE":
+            # Just continue the span close sequence until it is complete
+            return {self.SPAN_CLOSE[self.seq_pos]}
+
+        return set()
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        """
+        Apply the constrained generation logic to the scores.
+        """
+        if self.prompt_len is None:
+            self.prompt_len = input_ids.shape[1] # Set the prompt length on the first call
+
+        # Reasoning-skip detection, for families where the MODEL emits the opener
+        # (Gemma-4). If it never opens the block it never emits the end marker either,
+        # so reasoning_ended() below would stay False forever and the whole generation
+        # would run UNCONSTRAINED.
+        if (self.reasoning_model and self.reasoning_start_marker
+                and not self.reasoning_started and not self.found_reasoning_end):
+            if input_ids.shape[1] == self.prompt_len:
+                # On first step, allow the reasoning start marker to be emitted alongised constrained copy tokens.
+                # Depending on this, the FSM may either enter reasoning (if the opener is emitted) or skip reasoning.
+                allowed = self._allowed_tokens() | {self.reasoning_start_marker[0]}
+                self.prev_len = input_ids.shape[1]
+                return self._mask_except(scores, allowed)
+            if int(input_ids[0, -1]) == self.reasoning_start_marker[0]:
+                # Opener taken: normal reasoning path. Rewind prev_len so the FSM stays
+                # idle until reasoning actually ends (as it does when there is no opener).
+                self.reasoning_started = True
+                self.prev_len = 0
+            else:
+                # Reasoning skipped: the answer starts at the very first generated token,
+                # which was already constrained above and must now advance the FSM.
+                self.found_reasoning_end = True
+                self.output_start_index = self.prompt_len
+
+        # If this is a reasoning model and reasoning has not ended, do not apply any constraints and return the original scores.
+        if self.reasoning_model and not self.reasoning_ended(
+            input_ids[:, self.prompt_len:], self.reasoning_end_marker, self.found_reasoning_end
+            ):
+            return scores
+
+        if self.reasoning_model and not self.found_reasoning_end:
+            # If reasoning has just ended, set the flag to True to avoid checking again in future calls.
+            self.found_reasoning_end = True
+            self.output_start_index = input_ids.shape[1] # Set the output start index to the current length of input_ids
+            
+        # Get the last generated token ID from input_ids and advance the FSM state
+        last_token_id = int(input_ids[0, -1])
+        curr_len = input_ids.shape[1]
+        if self.prev_len > 0 and curr_len > self.prev_len:
+            self._advance_state(last_token_id)
+        self.prev_len = curr_len
+
+        allowed_tokens = self._allowed_tokens()
+        if not allowed_tokens:
+            # Dead-end in FSM/tokenization alignment: terminate safely instead of crashing sampling.
+            if self.eos_token_ids:
+                allowed_tokens = set(self.eos_token_ids)
+        scores = self._mask_except(scores, allowed_tokens)
+        
+        return scores
+    
