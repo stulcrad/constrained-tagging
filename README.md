@@ -21,6 +21,9 @@ Notebooks/          exploratory notebooks, including the two-phase derivation
 Experiment_results_publication/
                     per-run aggregate metrics (CSV), one directory per
                     dataset and approach
+Experiment_results_publication_full/
+                    the same for the full UniversalNER test sets (no cap),
+                    used for the comparison with published results
 ```
 
 ## What is not included
